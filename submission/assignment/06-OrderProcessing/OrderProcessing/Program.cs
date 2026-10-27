@@ -1,18 +1,19 @@
+using OrderProcessing.Phase1;
 using OrderProcessing.Shared.Cancellation;
-using OrderProcessing.Shared.Logging;
 using OrderProcessing.Shared.Storage;
 
-using RunCancellation cancellation = new();
-JsonFileStore store = new();
-DataSeeder seeder = new(store);
-
-try
+int? cancelAfter = null;
+int index = args.Length > 0 && args[0].Equals("phase1", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+if (index < args.Length)
 {
-    await seeder.ResetAsync(cancellation.Token);
+    if (args.Length - index != 2 || args[index] != "--cancel-after"
+        || !int.TryParse(args[index + 1], out int milliseconds) || milliseconds < 0)
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project OrderProcessing -- [phase1] [--cancel-after <ms>]");
+        return;
+    }
+    cancelAfter = milliseconds;
+}
 
-    Log.Success("Initial data is ready.");
-}
-catch (OperationCanceledException) when (cancellation.Token.IsCancellationRequested)
-{
-    Log.Info("Data initialization cancelled.");
-}
+using RunCancellation cancellation = new(cancelAfter);
+await new Phase1Runner(new JsonFileStore()).RunAsync(cancellation.Token);

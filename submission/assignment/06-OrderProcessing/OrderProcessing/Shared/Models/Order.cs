@@ -21,4 +21,10 @@ public class Order
 
     public string? FailureReason { get; set; }
     public string? TransactionId { get; set; }
+
+    public void Reject(string reason)
+    {
+        Status = OrderStatus.Rejected;
+        FailureReason = reason;
+    }
 }
