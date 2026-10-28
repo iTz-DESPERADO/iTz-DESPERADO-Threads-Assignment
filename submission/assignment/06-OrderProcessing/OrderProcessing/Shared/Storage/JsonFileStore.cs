@@ -21,6 +21,18 @@ public sealed class JsonFileStore
     private static SemaphoreSlim GateFor(string path) =>
         FileGates.GetOrAdd(path, static _ => new SemaphoreSlim(1, 1));
 
+    private static bool IsReadOnlyPath(string path)
+    {
+        StringComparison comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+
+        // These files are seeded and read only files not need gate for it there is no problem if to many thread read this safely (thread safe)
+        return string.Equals(path, DataFiles.PathFor(DataFiles.Customers), comparison)
+            || string.Equals(path, DataFiles.PathFor(DataFiles.Coupons), comparison)
+            || string.Equals(path, DataFiles.PathFor(DataFiles.IncomingOrders), comparison);
+    }
+
     public T? GetRecord<T>(string path, Predicate<T> filter)
     {
         ArgumentNullException.ThrowIfNull(filter);
@@ -60,6 +72,28 @@ public sealed class JsonFileStore
 
     public async Task<T?> GetRecordAsync<T>(string path, Predicate<T> filter,
         CancellationToken ct = default)
+    {
+        path = Normalize(path);
+
+        if (IsReadOnlyPath(path))
+            return await ReadRecordAsync(path, filter, ct);
+
+        SemaphoreSlim gate = GateFor(path);
+
+        await gate.WaitAsync(ct);
+
+        try
+        {
+            return await ReadRecordAsync(path, filter, ct);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task<T?> ReadRecordAsync<T>(string path, Predicate<T> filter,
+        CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(filter);
 
@@ -135,6 +169,27 @@ public sealed class JsonFileStore
     {
         path = Normalize(path);
 
+        if (IsReadOnlyPath(path))
+            return await ReadAllRecordsAsync<T>(path, ct);
+
+        SemaphoreSlim gate = GateFor(path);
+
+        await gate.WaitAsync(ct);
+        
+        try
+        {
+            return await ReadAllRecordsAsync<T>(path, ct);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task<List<T>> ReadAllRecordsAsync<T>(string path, CancellationToken ct)
+    {
+        path = Normalize(path);
+
         ct.ThrowIfCancellationRequested();
 
         try
@@ -190,7 +245,7 @@ public sealed class JsonFileStore
 
         try
         {
-            List<T> records = await GetAllRecordsAsync<T>(path, ct);
+            List<T> records = await ReadAllRecordsAsync<T>(path, ct);
 
             ct.ThrowIfCancellationRequested();
 
