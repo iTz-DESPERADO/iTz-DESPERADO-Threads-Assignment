@@ -15,6 +15,7 @@ namespace OrderProcessing.Shared.Logging
 
         public static void Write(string message , ConsoleColor consoleColor)
         {
+            ThreadUsage.Record();
             lock(Sync)
             {
                 var previous = Console.ForegroundColor;

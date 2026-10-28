@@ -2,7 +2,7 @@
 
 A .NET 10 console application for an order processing assignment covering asynchronous programming, concurrency, and thread safety. Data is stored in local JSON files, with simulated database and external service latency.
 
-The project contains the shared infrastructure, Phase 1 (data access and sequential validation), and Phase 2 (concurrent processing, invoices, and reports). Phases 3–4 are not implemented.
+The project contains shared infrastructure and Phases 1–3: sequential validation, concurrent processing, and full checkout. Phase 4 is not implemented.
 
 ## Running the project
 
@@ -14,6 +14,10 @@ dotnet run --project OrderProcessing -- phase1
 dotnet run --project OrderProcessing -- phase1 --cancel-after 4000
 dotnet run --project OrderProcessing -- phase2
 dotnet run --project OrderProcessing -- phase2 --cancel-after 18000
+dotnet run --project OrderProcessing -- phase3
+dotnet run --project OrderProcessing -- phase3 --cancel-after 9000
+dotnet run --project OrderProcessing -- phase3-compare
+dotnet run --project OrderProcessing -- phase3-fire-and-forget
 ```
 
 The entry point runs Phase 1 by default. It resets and loads the input, validates all 20 orders synchronously without saving, resets again, then validates and saves each order asynchronously in sequence. Ctrl+C or `--cancel-after <ms>` cancels the run.
@@ -31,6 +35,7 @@ OrderProcessing/
 |-- Program.cs
 |-- Phase1/
 |-- Phase2/
+|-- Phase3/
 +-- Shared/
     |-- Models/
     |   +-- Enums/
@@ -82,7 +87,7 @@ Invalid JSON raises `DataFileCorruptedException` with the affected file name. As
 
 Async reads and updates share a semaphore per file path for mutable files. Reads of the exact customers.json, coupons.json, and incoming_orders.json paths under Data bypass the gate because these files are read-only after seeding. This assumes reset/seeding finishes before reads begin and does not overlap the run. Updates protect the complete read-modify-write operation. Reads hold the same gate until their stream closes, preventing Windows file-replacement conflicts during concurrent processing. This prevents concurrent updates from overwriting each other's changes. Writes first serialize to a temporary file in the same directory, then replace the destination, so failed serialization does not publish partial JSON.
 
-Seeding runs before other operations, with a separate file for each task. It does not require a per-file semaphore in this usage. The synchronous update method currently assumes sequential use; concurrent synchronous writers are not supported yet.
+Seeding runs before other operations, with a separate file for each task. It does not require a per-file semaphore in this usage. Synchronous reads of mutable files and synchronous updates now acquire the same per-file semaphore, supporting the dedicated-thread comparison in Phase 3. SemaphoreSlim.Wait blocks a synchronous caller; it is not a blocking wait on a Task. Read-only seed-file reads still bypass the gate.
 
 ### Logging and simulated latency
 
@@ -227,3 +232,87 @@ The complete console log, final JSON collections, 13 invoice files, and report a
 - A run with `--cancel-after 18000` ended with `Run cancelled — 5 orders finished, 15 cancelled.` All runtime JSON parsed successfully; cancelled orders retained no stock and no temporary files remained.
 - A storage check ran 50 overlapping updates and reads and verified that all 50 updates were retained without file-access errors.
 - No group task-wait APIs are used. The only Task.Run call site is invoice rendering; the only blocking task wait is BlockingDemo.Run.
+
+## Phase 3 design
+
+`phase3` runs the full 20-order checkout with the configured failures. `phase3-compare` runs Task 9.6, resetting before each version; `phase3-fire-and-forget` runs Task 9.7 on freshly seeded data. The demonstrations are separate commands because each changes the runtime data. Run `phase3` to regenerate the expected final checkout files. Each command uses the existing Ctrl+C / --cancel-after cancellation source.
+
+CustomerService uses CustomerRepository and throws CustomerNotFoundException for a missing customer. InventoryService checks all requested products and quantities in one protected update before subtracting anything, so a rejected reservation leaves every item unchanged. Each order has its own InventoryService instance. Reservation and release state are updated immediately after the file write, before the Commit delay, so cancellation at that boundary does not leak or double-release stock.
+
+Phase 2 PricingService is reused with an empty shipping-failure list and now exposes CalculateTotalAsync. It obtains subtotal first, then overlaps discount and shipping and fills the four money fields. Invalid coupons throw InvalidCouponException. No Phase 2 invoice or report step is added to Phase 3 checkout.
+
+PaymentGateway implements IPaymentGateway. It logs Authorize (800 ms), Fraud check (500 ms), and Capture (700 ms), writes Captured/Declined payments through JsonFileStore, and generates captured transaction IDs as TXN- plus 12 uppercase hexadecimal characters. RefundAsync follows the external API delays and changes the existing record to Refunded.
+
+Failures are constructor configuration: payment timeout IDs `{ 5 }`, decline IDs `{ 8 }`, completed-order save failure IDs `{ 13 }`, and email failure counts `{ [3] = 2, [17] = int.MaxValue }`. Order IDs are not hardcoded into the processor's control flow. `Phase3Runner(store, disableFailures: true)` disables these injected failures for the comparison; ordinary inactive-customer and insufficient-stock validation still applies.
+
+OrderProcessor receives its services through the constructor and performs customer lookup, reservation, pricing, payment, order save, and email. Each step logs its timestamp and elapsed duration. Payment uses a linked cancellation source with CancelAfter(3000): the gateway receives its token for every delay and file operation. A gateway timeout becomes PaymentFailed with the required reason; cancellation of the run becomes Pending / Cancelled. Declines release stock. A Completed save failure refunds the captured payment, releases stock, and upserts the exact Failed reason containing the transaction ID. Every stopped order is saved.
+
+EmailRetryService makes one initial attempt plus three retries, waiting 500, 1000, and 2000 ms before the retries. It logs every SMTP failure. The fourth failure appends a message with Attempts = 4 and LastError to email_retry.json and returns normally, preserving the paid order's Completed status. EmailService stores successful messages with their actual attempt count. Cancellation is not retried as an SMTP error.
+
+Cancellation cleanup uses a separate token to finish refunds, stock release, and saving Pending / Cancelled after the run token is cancelled. The runner awaits every task already started and does not start additional orders after observing cancellation. The full-run cancellation test covered already captured payments and email retries.
+
+### Phase 3 expected state verified from files
+
+| File | Observed full-run result |
+|---|---|
+| orders.json | 20 unique orders: 11 Completed, 6 Rejected, 2 PaymentFailed, 1 Failed |
+| payments.json | 13: 11 Captured, 1 Declined (#8), 1 Refunded (#13); no record for #5 |
+| emails.json | 10: Completed orders except #17; #3 has Attempts = 3 |
+| email_retry.json | One message for #17, Attempts = 4, LastError = SMTP server unavailable |
+| products.json | Initial stock minus quantities from Completed orders only; keyboard stock = 0 |
+
+The five fixed rejections are #4, #9, #12, #15, and #18; one of #10/#11 is the sixth rejection. #5 has `Payment gateway timeout (3s)`, #8 has `Card declined by issuer`, and #13 has `Database save failed after payment; payment {TransactionId} refunded`. The full final collections and real console logs are in `sample-output/phase3/`.
+
+### Task 9.6: synchronous versus asynchronous checkout
+
+The synchronous services use Thread.Sleep via SimulatedLatency and JsonFileStore's synchronous methods. SyncOrderProcessor runs on a new Thread per order; all ten threads are started before Join is called on each. The async comparison uses the real OrderProcessor with failures disabled, starts all ten tasks, then awaits them individually. Both runs use orders #1–#10 and reset first.
+
+ThreadUsage records distinct managed thread IDs that emit workflow log lines during each timed run. These are observed executing threads, not a count of threads continuously occupied by the workload. ThreadPool.ThreadCount is printed separately before and after; it is process-wide and does not include the ten manually created threads. Measuring with Stopwatch excludes initialization, loading input, and the final summary queries.
+
+Actual output:
+
+```text
+Sync comparison: 10.786 seconds; dedicated threads = 10; observed workflow threads = 10; ThreadPool.ThreadCount = 4 -> 4
+Sync comparison: 8 Completed, 2 Rejected
+Async comparison: 9.120 seconds; dedicated threads = 0; observed workflow threads = 8; ThreadPool.ThreadCount = 6 -> 8
+Async comparison: 8 Completed, 2 Rejected
+```
+
+1. Async does not make the database, payment, or email operation itself faster. Here the async pricing step overlaps discount and shipping while synchronous pricing waits for them in sequence, so one workflow can finish sooner because of that overlap. Random delays also affect the measured difference this is not proof that adding async alone accelerates one order.
+
+2. Async scales better for many waiting orders because a pending I/O operation does not require its own blocked thread. Available threads can execute ready continuations from other orders. The comparison created ten dedicated threads for sync and zero for async; the eight observed async thread IDs were shared executing threads, not eight threads blocked throughout the run.
+
+3. With 1,000 orders this particular synchronous design would attempt to create 1,000 threads. Their stacks, creation cost, scheduling, and context switches consume resources even while most are blocked waiting. It may hit resource limits. Async still needs limits for real downstream capacity, but it avoids dedicating a blocked thread to each I/O wait.
+
+4. Database, file, and API operations spend time waiting for external work. Await lets a UI remain responsive and lets servers reuse threads for other requests while that work is pending. Async improves responsiveness and scalability; it does not eliminate I/O latency or make every small console program faster. [Microsoft: asynchronous scenarios](https://learn.microsoft.com/en-us/dotnet/csharp/asynchronous-programming/async-scenarios).
+
+### Task 9.7: fire-and-forget investigation
+
+BrokenFireAndForgetDemo contains the supplied method unchanged, with CS4014 suppressed only for the unawaited email call. It is isolated from checkout. The missing await means the returned task represents only order saving: email work may still be pending after `Order processing finished`, and an email exception is not propagated to that caller. The exact broken example has no cancellation parameter as specified the fixed method accepts and forwards ct.
+
+The demonstration records the email task in a small tracking wrapper so the observer can inspect it and drain it afterward. That observation belongs to the investigation, not the broken method. It deliberately avoids leaving test work running after the demonstration returns.
+
+Actual before/after evidence:
+
+```text
+[09:43:01.462] [Thread 12] Broken method returned; email task completed = False; sent emails = 0
+[09:43:05.164] [Thread 12] Fixed method returned; email task completed = True; sent emails = 2
+[09:43:06.724] [Thread 12] Broken method returned without an email exception.
+[09:43:07.732] [Thread 12] Observer later found email task Faulted: SMTP server unavailable
+[09:43:09.684] [Thread 10] Fixed caller caught: SMTP server unavailable
+```
+
+The fixed-success count is two because the observer first waited for the earlier broken example's successful email; the fixed example then sent the second email. On the fixed failure path, `Order processing finished` is not printed because awaiting the email propagates the error. The full transcript includes the SMTP steps before and after each completion message.
+
+Await is necessary when completion, a result, ordering, or failure matters to the caller. If the console process exits while the unawaited email is pending, there is no guarantee it will be sent; the observed return-before-send case demonstrates why printing completion is unsafe. This test demonstrates method return and delayed failure rather than terminating the process mid-send.
+
+Fire-and-forget can be acceptable for deliberately independent, noncritical work only when another owner supervises its lifetime, cancellation, and exceptions, and losing the work is acceptable. Reliable order confirmation should be awaited or handed to a durable, supervised queue. Merely discarding the task provides none of those guarantees.
+
+An async void method returns no task, so callers cannot await its completion or observe its later exception through an awaited task. Event handlers are the normal exception because their required signature returns void; those handlers should catch errors at their boundary and delegate substantial work to Task-returning methods. [Microsoft: common async bugs](https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/common-async-bugs).
+
+### Phase 3 verification
+
+The project builds without warnings or errors. Full-run checks verified the exact status/payment/email counts, exact failure reasons, transaction-ID format and amounts, no payment for the timed-out order, retry attempt counts, and stock conservation. The comparison produced 8 Completed and 2 Rejected in both versions. The fire-and-forget transcript demonstrates pending work and exception propagation before/after the fix.
+
+A separate `--cancel-after 9000` run reported `Run cancelled — 9 orders finished, 11 cancelled.` Its final files contained 9 Refunded, 3 Captured, and 1 Declined payment. Cancelled orders had no Captured payment or reserved stock left; sent emails belonged only to Completed orders. All JSON parsed successfully and no temporary files remained. Cancellation results vary with random simulated delays.
+Additional checks covered a multi-item reservation whose second item has insufficient stock (no partial deduction), cancellation during reservation/release Commit delays (stock restored once), 50 simultaneous synchronous updates (no lost writes), and cancellation before initialization (0 finished, 0 cancelled without counting data from an earlier run).

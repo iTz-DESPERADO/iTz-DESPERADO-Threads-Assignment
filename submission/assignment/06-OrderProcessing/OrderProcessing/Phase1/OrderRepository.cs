@@ -2,12 +2,16 @@ using OrderProcessing.Shared.Models;
 using OrderProcessing.Shared.Models.Enums;
 using OrderProcessing.Shared.Simulation;
 using OrderProcessing.Shared.Storage;
+using OrderProcessing.Shared.Exceptions;
 
 namespace OrderProcessing.Phase1;
 
-public sealed class OrderRepository(JsonFileStore store)
+public sealed class OrderRepository(JsonFileStore store, IEnumerable<int>? failSaveForOrderIds = null,
+    bool disableFailures = false)
 {
-    public async Task SaveAsync(Order order, CancellationToken ct)
+    private readonly HashSet<int> _failSaveForOrderIds = disableFailures ? [] : new(failSaveForOrderIds ?? []);
+
+    public async Task SaveAsync(Order order, CancellationToken ct = default)
     {
         await SimulatedLatency.DatabaseWriteAsync("OrderRepository", async token =>
         {
@@ -24,6 +28,9 @@ public sealed class OrderRepository(JsonFileStore store)
                 
             }, token);
         }, ct);
+
+        if (order.Status == OrderStatus.Completed && _failSaveForOrderIds.Contains(order.Id))
+            throw new DatabaseWriteException("Connection lost during commit");
     }
 
     public async Task<List<Order>> GetAllAsync(CancellationToken ct)

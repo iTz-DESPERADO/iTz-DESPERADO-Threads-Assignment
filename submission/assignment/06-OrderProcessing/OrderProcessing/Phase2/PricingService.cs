@@ -15,6 +15,12 @@ public sealed class PricingService(
 {
     private readonly HashSet<int> _failShippingForOrderIds = new(failShippingForOrderIds);
 
+    public async Task<decimal> CalculateTotalAsync(Order order, CancellationToken ct)
+    {
+        await new OrderPricer(this).PriceOrderAsync(order, ct);
+        return order.TotalAmount;
+    }
+
     public async Task<decimal> CalculateSubTotalAsync(Order order, CancellationToken ct)
     {
         List<Product> products = await SimulatedLatency.DatabaseQueryAsync("PricingService",

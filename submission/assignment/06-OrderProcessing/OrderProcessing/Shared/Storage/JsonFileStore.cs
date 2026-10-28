@@ -35,6 +35,17 @@ public sealed class JsonFileStore
 
     public T? GetRecord<T>(string path, Predicate<T> filter)
     {
+        path = Normalize(path);
+        if (IsReadOnlyPath(path))
+            return ReadRecord(path, filter);
+        SemaphoreSlim gate = GateFor(path);
+        gate.Wait();
+        try { return ReadRecord(path, filter); }
+        finally { gate.Release(); }
+    }
+
+    private T? ReadRecord<T>(string path, Predicate<T> filter)
+    {
         ArgumentNullException.ThrowIfNull(filter);
         path = Normalize(path);
         try
@@ -141,6 +152,17 @@ public sealed class JsonFileStore
     public List<T> GetAllRecords<T>(string path)
     {
         path = Normalize(path);
+        if (IsReadOnlyPath(path))
+            return ReadAllRecords<T>(path);
+        SemaphoreSlim gate = GateFor(path);
+        gate.Wait();
+        try { return ReadAllRecords<T>(path); }
+        finally { gate.Release(); }
+    }
+
+    private List<T> ReadAllRecords<T>(string path)
+    {
+        path = Normalize(path);
 
         try
         {
@@ -222,14 +244,23 @@ public sealed class JsonFileStore
 
         path = Normalize(path);
 
-        List<T> records = GetAllRecords<T>(path);
+        SemaphoreSlim gate = GateFor(path);
+        gate.Wait();
+        try
+        {
+            List<T> records = ReadAllRecords<T>(path);
 
-        if (!mutator(records)) 
-            return false;
+            if (!mutator(records))
+                return false;
 
-        ReplaceAtomically(path, records);
+            ReplaceAtomically(path, records);
 
-        return true;
+            return true;
+        }
+        finally 
+        { 
+            gate.Release();
+        }
     }
 
     public async Task<bool> UpdateRecordsAsync<T>(string path,
