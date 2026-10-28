@@ -2,7 +2,7 @@
 
 A .NET 10 console application for an order processing assignment covering asynchronous programming, concurrency, and thread safety. Data is stored in local JSON files, with simulated database and external service latency.
 
-The project contains shared infrastructure and Phases 1–3: sequential validation, concurrent processing, and full checkout. Phase 4 is not implemented.
+The project contains all four phases: sequential validation, concurrent processing, full checkout, and scale-up demonstrations.
 
 ## Running the project
 
@@ -18,9 +18,13 @@ dotnet run --project OrderProcessing -- phase3
 dotnet run --project OrderProcessing -- phase3 --cancel-after 9000
 dotnet run --project OrderProcessing -- phase3-compare
 dotnet run --project OrderProcessing -- phase3-fire-and-forget
+dotnet run --project OrderProcessing -- phase4
+dotnet run --project OrderProcessing -- phase4 --cancel-after 9000
+dotnet run --project OrderProcessing -- all
+dotnet run --project OrderProcessing
 ```
 
-The entry point runs Phase 1 by default. It resets and loads the input, validates all 20 orders synchronously without saving, resets again, then validates and saves each order asynchronously in sequence. Ctrl+C or `--cancel-after <ms>` cancels the run.
+The entry point is `static async Task Main(string[] args)`. With no arguments it displays a numbered menu for all four phases, all phases in order, and the two Phase 3 investigations. `all` runs Phase 1 through Phase 4; each phase owns its cancellation source and data reset. Ctrl+C or `--cancel-after <ms>` cancels the current phase and stops `all` before starting another phase.
 
 Data is created under `Path.Combine(AppContext.BaseDirectory, "Data")`. For a Debug build, this is normally `OrderProcessing/bin/Debug/net10.0/Data/`.
 
@@ -36,6 +40,7 @@ OrderProcessing/
 |-- Phase1/
 |-- Phase2/
 |-- Phase3/
+|-- Phase4/
 +-- Shared/
     |-- Models/
     |   +-- Enums/
@@ -316,3 +321,108 @@ The project builds without warnings or errors. Full-run checks verified the exac
 
 A separate `--cancel-after 9000` run reported `Run cancelled — 9 orders finished, 11 cancelled.` Its final files contained 9 Refunded, 3 Captured, and 1 Declined payment. Cancelled orders had no Captured payment or reserved stock left; sent emails belonged only to Completed orders. All JSON parsed successfully and no temporary files remained. Cancellation results vary with random simulated delays.
 Additional checks covered a multi-item reservation whose second item has insufficient stock (no partial deduction), cancellation during reservation/release Commit delays (stock restored once), 50 simultaneous synchronous updates (no lost writes), and cancellation before initialization (0 finished, 0 cancelled without counting data from an earlier run).
+
+## Phase 4 design
+
+Phase4Runner resets once, runs Tasks 10.1–10.4 in order, and reuses the real Phase 3 checkout with the same constructor-injected failures. It does not reset between these tasks. Measurements use Stopwatch and print observed distinct managed thread IDs and ThreadPool.ThreadCount.
+
+- **Live progress:** starts all twenty checkout operations and consumes their completion with Task.WhenEach. Each completed task returns its order and elapsed time; the runner prints one numbered progress line. No unfinished-task list is searched or rebuilt after each completion. Counts are read from orders.json after all operations finish. Cancellation does not abandon the completion enumeration, allowing every started order to finish refund/stock cleanup.
+
+- **CustomerDashboardService:** starts four database-query simulations for profile, orders, payments, and emails and awaits Task.WhenAll once. Each load assigns its separate dashboard property. Payments and emails map order IDs to the requested customer using incoming_orders.json inside their load. A missing customer throws CustomerNotFoundException. The configured payments outage for customer 99 throws TimeoutException. The aggregate from the group task is propagated so the runner prints both errors.
+
+- **FastShip, CairoExpress, NileCourier:** implement IShippingCarrier with their specified delay ranges and price factors. CarrierQuote shares only the handshake, formula, file lookup, and cancellation logging. CairoExpress rejects even order IDs after its response delay. Explicit failForOrderIds represents a handshake outage and fails immediately after 150 ms, making the separate all-carriers-failed example deterministic within the 1.2-second budget. Normal responses retain the required random ranges. Quotes derive subtotal and weight from product prices and order items, including when incoming order money fields are still zero.
+
+- **ShippingQuoteService:** starts all three requests, uses Task.WhenAny to examine finished requests, skips failures, and returns the first successful quote. A linked token enforces the 1.2-second budget and propagates caller cancellation. Remaining carriers are cancelled and all tasks are observed before returning. No success before the deadline yields Flat rate / 25.00; three failures within the budget yield the exact All carriers failed exception. ElapsedMs measures arrival/timeout; the surrounding measurement also includes brief cancellation cleanup.
+
+- **FraudScoring:** creates 10,000 in-memory Order objects and uses the supplied Score calculation unchanged. The first pass uses a plain foreach; the second uses Parallel.ForEach with MaxDegreeOfParallelism = Environment.ProcessorCount. A ConcurrentBag collects flagged IDs and the sorted results are compared with the sequential list. Cancellation is checked before each 100,000-iteration score, bounding cancellation latency to the short current score.
+
+- **EmailResend:** uses Parallel.ForEachAsync with MaxDegreeOfParallelism = 4 to send test messages for order IDs 1001–1030 through IEmailService, with failures disabled. The library schedules and limits the operations. Interlocked counters only measure active/peak sends; they do not implement a limit. Tokens reach every send and delay.
+
+### Phase 4 observed results
+
+Live checkout printed all twenty progress lines in completion order, ending at [20/20], then reported 11 Completed, 6 Rejected, 2 PaymentFailed and 1 Failed. The keyboard winner in this run was #11. Customer #3 returned Omar Hassan with #3 Completed / #13 Failed, #3 Captured / #13 Refunded, and one email for #3. Customer #99 printed both `Customer #99 not found` and `Payments store timeout`.
+
+| Order | Winning quote | Price | Arrival / timeout (ms) | Cancelled carriers |
+|---|---|---:|---:|---|
+| 1 | NileCourier | 0.00 | 1021 | CairoExpress, FastShip |
+| 2 | Flat rate | 25.00 | 1201 | CairoExpress, FastShip, NileCourier |
+| 3 | FastShip | 10.70 | 930 | CairoExpress, NileCourier |
+| 4 | NileCourier | 7.81 | 1166 | CairoExpress, FastShip |
+| 5 | CairoExpress | 15.68 | 912 | FastShip, NileCourier |
+
+The separate all-failed run for #6 printed `All carriers failed`. A deadline measured at 1201 ms reflects timer/scheduler overhead around the requested 1200 ms, not an additional wait for a full carrier response.
+
+Both fraud passes produced exactly 1005 flagged IDs, with the same complete ID list and first five `4, 8, 12, 29, 33`. The measured CPU speed-up was 14.59x on Environment.ProcessorCount = 16. All thirty test emails were written exactly once; peak simultaneous sends was exactly 4 and duration was 8.110 seconds. Seven full waves of four and a final wave of two explain the approximately eight seconds of SMTP delays.
+
+At the end of Task 10.1 the email outbox contains the ten checkout messages. Task 10.4 B adds thirty test messages, so the **final Phase 4 emails.json contains 40 records**. Orders, payments, retry queue, and product stock retain the checkout result. The eight final JSON collections are in `sample-output/phase4/`; test orders for fraud scoring and email re-send are never added to orders.json.
+
+### Consolidated performance table
+
+Times are measured seconds, not expected values. Phases 1–2 were measured again by an external verification program using the existing classes; its complete output is `sample-output/phase4/performance-baseline.txt`. Earlier phase sections retain their original runs. Phase 3 values come from its comparison transcript, and Phase 4 values come from its full-run transcript. Random delays and different process histories mean pool sizes and times vary between runs.
+
+| Work | Time (s) | Distinct observed threads | ThreadPool.ThreadCount |
+|---|---:|---:|---:|
+| Phase 1 sync validation | 35.267 | 1 | 1 |
+| Phase 1 async validation + save | 53.752 | 4 | 4 |
+| Phase 2 sequential pricing | 4.953 | 2 | 4 |
+| Phase 2 concurrent pricing | 3.206 | 2 | 4 |
+| Phase 2 concurrent validation + processing | 13.064 | 9 | 10 |
+| Phase 3 sync checkout (10 dedicated threads) | 10.786 | 10 | 4 -> 4 |
+| Phase 3 async checkout (10 tasks) | 9.120 | 8 | 6 -> 8 |
+| Phase 4 live checkout | 16.336 | 8 | 9 |
+| Phase 4 dashboard #3 | 0.659 | 4 | 9 |
+| Phase 4 dashboard #99 | 0.752 | 4 | 9 |
+| Phase 4 shipping #1 | 1.024 | 3 | 9 |
+| Phase 4 shipping #2 | 1.202 | 3 | 9 |
+| Phase 4 shipping #3 | 0.930 | 3 | 5 |
+| Phase 4 shipping #4 | 1.167 | 3 | 5 |
+| Phase 4 shipping #5 | 0.913 | 3 | 5 |
+| Phase 4 fraud sequential | 4.044 | 1 | 5 |
+| Phase 4 fraud parallel | 0.277 | 16 | 16 |
+| Phase 4 email re-send | 8.110 | 5 | 16 |
+
+Distinct observed threads means managed IDs that executed measured work/logging, not simultaneously occupied threads. CPU scoring records the thread of every iteration. ThreadPool.ThreadCount is a process-wide snapshot, not the number of busy workers; manually created threads are not included. Phase 1 async includes saves that its sync comparison explicitly omits. The Phase 2 processing measurement excludes its setup demonstrations.
+
+### Phase 4 answers
+
+1. **10.1:** Task.WhenEach provides completed tasks without searching/rebuilding an unfinished list. Awaiting in start order delays reports of later tasks that already finished.
+
+   **10.2:** Task.WhenAll provides the required single group await and retains all failures. Starting all loads then awaiting individually can overlap them, but does not meet the single-await requirement and may stop observation at the first failure. 
+
+   **10.3:** Task.WhenAny lets the first successful carrier win, regardless of request order; individual ordered awaits can wait behind a slow or failed carrier and miss the budget.
+
+   **10.4 A:** Parallel.ForEach partitions CPU work and caps simultaneous iterations at ProcessorCount. Awaiting an arbitrary task list does not itself provide that scheduling/limit.
+
+   **10.4 B:** Parallel.ForEachAsync supplies bounded I/O concurrency of four; starting thirty tasks first would exceed the limit, while awaiting immediately after each send would serialize them. [Microsoft: Task.WhenEach](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.wheneach?view=net-10.0), [Parallel.ForEachAsync](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.parallel.foreachasync?view=net-10.0).
+
+2. Keep the Task returned by Task.WhenAll. After catching the await failure, inspect its Exception.Flatten().InnerExceptions to obtain every fault. Plain await normally propagates one exception, even when the group task retains several. Dashboard #99 demonstrates both the profile and payment failures. [Microsoft: Task.WhenAll](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.whenall?view=net-10.0).
+
+3. Losing carriers continue their delays and work unless cancelled. In a real application they could keep connections or consume service capacity and finish/fail after the caller already has a quote. WhenAny does not cancel losers automatically. Here a linked source cancels them, their logs identify cancellation, and their tasks are observed before returning.
+
+4. Fraud scoring continuously uses the CPU; independent scores can run on different cores, reducing elapsed time until overhead or resource limits dominate. SMTP simulation spends most time waiting, so four sends can overlap even on one core; its throughput is governed mainly by the concurrency limit and I/O latency.
+
+5. Parallel work executes computations at the same time on multiple cores. Concurrent asynchronous checkout has multiple operations in progress and interleaves ready continuations while other operations wait. Concurrency does not require a dedicated thread or core for every order, though continuations may execute in parallel when resources are available.
+
+6. The `phase4 --cancel-after 9000` run reported `Run cancelled — 8 orders finished, 12 cancelled.` Six orders were already Rejected, one PaymentFailed, and one Completed. The twelve in-progress orders were persisted as Pending / Cancelled after compensation. Product stock equalled initial stock minus quantities from the single Completed order. Payments ended as 11 Refunded, 1 Captured and 1 Declined; cancelled orders retained no captured charge. All JSON parsed and no temporary files remained. Cancellation stops new work immediately but the process waits for required refund/release/save cleanup, explaining progress lines beyond nine seconds. See `sample-output/phase4/cancellation-output.txt`.
+
+### Phase 4 verification and issues resolved
+
+Build succeeded with no warnings or errors. File checks confirmed twenty unique checkout orders, expected status/payment counts, thirty distinct test email IDs each appearing once, the unchanged checkout stock rule, and a 1–20 progress counter whose order IDs differ from input order. Isolated checks covered a failed carrier finishing before a successful one, all carriers failing, a deterministic deadline fallback, caller cancellation reaching every carrier, prompt cancellation of the parallel CPU loop, and aggregation of both dashboard failures. Losing tasks are always observed. Deadline handling drains completed responses before deciding on fallback so a success that arrived within budget is not discarded merely because a failed response was observed first.
+
+The earlier Windows file-replacement conflict was solved with a shared read/update gate for mutable JSON files; the synchronous path uses the same gate for the Phase 3 thread comparison. The three read-only seed files bypass read gates because initialization finishes before any readers start. Cancellation bookkeeping records writes before Commit delays so cleanup does not lose or duplicate stock releases. These fixes remain in use in Phase 4.
+
+### Console evidence images
+
+These are **browser screenshots of excerpts from actual saved console logs**, with source paths shown in each image; they are not screenshots of a live terminal window. Full unfiltered transcripts remain under sample-output. No output values were invented or changed for the images.
+
+| Evidence | Image |
+|---|---|
+| Phase 1 validation | [Validation summary](screenshots/phase1-validation.png) |
+| Phase 2 race / faulted task | [Race and failure](screenshots/phase2-race-and-failure.png) |
+| Phase 3 timeout / refund / retries | [Payment and email](screenshots/phase3-payment-and-email.png) |
+| Both fire-and-forget demonstrations | [Before and after](screenshots/phase3-fire-and-forget.png) |
+| Phase 4 Task 10.1 | [Live progress](screenshots/phase4-live-progress.png) |
+| Phase 4 Task 10.2 | [Dashboard](screenshots/phase4-dashboard.png) |
+| Phase 4 Task 10.3 | [Shipping](screenshots/phase4-shipping.png) |
+| Phase 4 Task 10.4 A and B | [Fraud and email](screenshots/phase4-fraud-and-email.png) |
+| Cancelled Phase 4 run | [Cancellation](screenshots/phase4-cancelled.png) |
