@@ -1,0 +1,7 @@
+﻿Invoice #10
+Customer #10
+SubTotal: 90.00
+Discount: 4.50
+Shipping: 8.30
+Total: 93.80
+Render checksum: 959998845

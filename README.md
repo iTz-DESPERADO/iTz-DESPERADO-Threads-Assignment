@@ -1,2 +1,3 @@
-# iTz-DESPERADO-Threads-Assignment
-Assignment repo for assignment/1-8 (Threads Assignment)
+**Student name**: Gamal Khaled Mohamed  
+
+**Group / ID**: G4
